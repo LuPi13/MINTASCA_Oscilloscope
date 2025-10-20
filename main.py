@@ -87,7 +87,7 @@ class SerialManager(threading.Thread):
             if self.recording:
                 current_time = time.time()
                 if (current_time - self.last_sent_time) >= self.recording_interval:
-                    self.send_command("100 1 1\n")
+                    self.send_command("101 1 1\n")
                     self.last_sent_time = current_time
 
             # Read data from serial port
