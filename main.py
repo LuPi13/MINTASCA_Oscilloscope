@@ -25,7 +25,7 @@ class DataLogger:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         filepath = os.path.join("logs", f"{timestamp}.csv")
         
-        self.file = open(filepath, 'w', newline='')
+        self.file = open(filepath, 'w', newline='', buffering=1)  # Line buffering
         self.writer = csv.writer(self.file)
         # Write header
         self.writer.writerow(["timestamp_ms", "voltage_mV", "current_mA", "pwm_duty_permille", "pwm_pin_state", "hyst_pin_state"])
@@ -33,8 +33,9 @@ class DataLogger:
         print(f"Logging started to {filepath}")
 
     def write_row(self, data_row):
+        """data_row는 이제 [timestamp_ms, voltage, current, duty, pwm_pin, hyst_pin] 형태로 받음"""
         if self.writer and self.is_logging:
-            self.writer.writerow([datetime.now().timestamp() * 1000] + data_row)
+            self.writer.writerow(data_row)
 
     def stop(self):
         if self.file:
@@ -55,16 +56,27 @@ class SerialManager(threading.Thread):
         self.recording = False
         self.last_sent_time = 0
         self.recording_interval = 0.001 # 1ms
+        self.send_count = 0  # 전송 카운터
+        self.buffer_warning_count = 0  # 버퍼 경고 카운터
 
     def run(self):
         try:
-            # 하드코딩된 포트 정보 사용
-            self.serial_port = serial.Serial('COM5', 115200, timeout=1)
-            self.data_queue.put(("status", "Serial port opened successfully."))
+            # Non-blocking 모드: timeout=0, write_timeout=0
+            # rtscts와 xonxoff를 명시적으로 비활성화
+            self.serial_port = serial.Serial(
+                port='COM5',
+                baudrate=921600,
+                timeout=0,  # Non-blocking read
+                write_timeout=0,  # Non-blocking write
+                rtscts=False,  # 하드웨어 플로우 컨트롤 비활성화
+                xonxoff=False  # 소프트웨어 플로우 컨트롤 비활성화
+            )
+            self.data_queue.put(("status", "Serial port opened successfully (non-blocking mode)."))
         except serial.SerialException as e:
             self.data_queue.put(("status", f"Error opening serial port: {e}"))
             return
 
+        read_buffer = ""  # 읽기 버퍼 (부분 라인 저장용)        
         while not self.stop_event.is_set():
             # Check for incoming commands from the GUI
             try:
@@ -76,42 +88,142 @@ class SerialManager(threading.Thread):
                     self.send_command(command[5:])
                 elif command == "start_recording":
                     self.recording = True
-                    self.last_sent_time = time.time()
+                    self.last_sent_time = time.perf_counter()  # 고정밀 타이머 사용
+                    self.send_count = 0
+                    self.buffer_warning_count = 0
+                    
+                    # 시작 전에 버퍼 완전히 클리어 (이전 측정의 잔여 데이터 제거)
+                    if self.serial_port and self.serial_port.is_open:
+                        try:
+                            # 입출력 버퍼 모두 클리어
+                            flushed_in = self.serial_port.in_waiting
+                            flushed_out = self.serial_port.out_waiting
+                            self.serial_port.reset_input_buffer()
+                            self.serial_port.reset_output_buffer()
+                            read_buffer = ""  # 읽기 버퍼도 초기화
+                            if flushed_in > 0 or flushed_out > 0:
+                                self.data_queue.put(("status", f"Cleared buffers before start: RX={flushed_in}, TX={flushed_out}"))
+                        except (OSError, serial.SerialException) as e:
+                            self.data_queue.put(("status", f"Buffer clear error: {e}"))
+                    
+                    self.data_queue.put(("status", "Recording started with high-precision timer."))
                 elif command == "stop_recording":
                     self.recording = False
-
+                    self.data_queue.put(("status", f"Recording stopped. Total commands sent: {self.send_count}, Buffer warnings: {self.buffer_warning_count}"))
+                    
+                    # 수신 버퍼에 남아있는 데이터 클리어 (잔여 응답 제거)
+                    if self.serial_port and self.serial_port.is_open:
+                        try:
+                            time.sleep(0.05)  # 마지막 응답들이 도착할 시간 대기
+                            flushed = self.serial_port.in_waiting
+                            if flushed > 0:
+                                self.serial_port.reset_input_buffer()
+                                self.data_queue.put(("status", f"Cleared {flushed} bytes from RX buffer"))
+                                read_buffer = ""  # 읽기 버퍼 초기화
+                        except (OSError, serial.SerialException) as e:
+                            pass
             except queue.Empty:
                 pass
 
-            # Handle periodic sending if recording is active
+            # Main logic diverges based on recording state for performance
             if self.recording:
-                current_time = time.time()
+                # 고정밀 타이머로 정확한 1ms 간격 유지
+                current_time = time.perf_counter()
                 if (current_time - self.last_sent_time) >= self.recording_interval:
-                    self.send_command("101 1 1\n")
-                    self.last_sent_time = current_time
+                    # Write buffer 상태 체크
+                    try:
+                        if self.serial_port.out_waiting > 1024:  # 버퍼가 1KB 이상 차있으면 경고
+                            self.buffer_warning_count += 1
+                            if self.buffer_warning_count % 100 == 1:  # 100번마다 한 번씩만 출력
+                                self.data_queue.put(("status", f"Warning: TX buffer is filling up ({self.serial_port.out_waiting} bytes)"))
+                    except (OSError, AttributeError):
+                        pass  # out_waiting이 지원되지 않는 경우 무시
+                    
+                    # 명령 전송
+                    success = self.send_command_nonblocking("101 1 01\n")
+                    if success:
+                        self.send_count += 1
+                    
+                    # 다음 전송 시간 계산
+                    self.last_sent_time += self.recording_interval
+                    # drift 방지: 너무 뒤쳐진 경우 현재 시간으로 재설정
+                    if self.last_sent_time < current_time - 0.1:  # 100ms 이상 뒤쳐진 경우
+                        self.last_sent_time = current_time
+            # recording이 아닐 때도 짧은 sleep만 사용 (항상 빠르게 읽기)
+            # time.sleep 제거 - 항상 빠르게 루프 돌면서 데이터 읽기
 
-            # Read data from serial port
-            if self.serial_port.in_waiting > 0:
+            # Always try to read incoming data to keep the serial buffer clear
+            # 항상 빠르게 읽어서 버퍼가 가득 차는 것을 방지
+            if self.serial_port:
                 try:
-                    line = self.serial_port.readline().decode('utf-8').strip()
-                    if line:
-                        self.data_queue.put(("serial", line))
-                except UnicodeDecodeError:
+                    # Non-blocking read: 가능한 만큼만 읽음
+                    available = self.serial_port.in_waiting
+                    if available > 0:
+                        # 버퍼가 너무 많이 쌓인 경우 경고
+                        if available > 2048:
+                            self.data_queue.put(("status", f"Warning: RX buffer has {available} bytes waiting!"))
+                        
+                        chunk = self.serial_port.read(available)
+                        if chunk:
+                            try:
+                                read_buffer += chunk.decode('utf-8')
+                                # 완성된 라인들을 처리
+                                while '\n' in read_buffer:
+                                    line, read_buffer = read_buffer.split('\n', 1)
+                                    line = line.strip()
+                                    if line:
+                                        # 데이터 수신 시점의 타임스탬프를 즉시 기록
+                                        timestamp_ms = time.time() * 1000
+                                        self.data_queue.put(("serial", line, timestamp_ms))
+                            except UnicodeDecodeError:
+                                read_buffer = ""  # 디코딩 실패 시 버퍼 초기화
+                except (OSError, serial.SerialException) as e:
+                    # Non-blocking 모드에서 발생할 수 있는 예외 처리
                     pass
             
-            # A small sleep to prevent the loop from consuming 100% CPU
-            time.sleep(0.0001)
+            # recording이 아닐 때만 짧은 sleep (CPU 사용률 절감)
+            if not self.recording:
+                time.sleep(0.0001)  # 0.1ms sleep (거의 안 자지만 CPU는 조금 쉼)
 
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
         self.data_queue.put(("status", "Serial port closed."))
 
-    def send_command(self, command):
+    def send_command_nonblocking(self, command):
+        """Non-blocking 방식으로 명령을 전송하고 성공 여부를 반환"""
         if self.serial_port and self.serial_port.is_open:
-            self.serial_port.write(command.encode('utf-8'))
-            # To avoid flooding the console, we don't print the periodic message
-            if "100 1 1" not in command:
-                print(f"Sent: {command.strip()}")
+            try:
+                encoded = command.encode('utf-8')
+                bytes_written = self.serial_port.write(encoded)
+                
+                # 부분 전송 체크
+                if bytes_written < len(encoded):
+                    self.data_queue.put(("status", f"Warning: Partial write ({bytes_written}/{len(encoded)} bytes)"))
+                    return False
+                return True
+            except serial.SerialTimeoutException:
+                # write_timeout=0이므로 즉시 반환, 버퍼가 가득 찬 경우
+                self.buffer_warning_count += 1
+                return False
+            except (OSError, serial.SerialException) as e:
+                self.data_queue.put(("status", f"Write error: {e}"))
+                return False
+        return False
+
+    def send_command(self, command):
+        """일반 명령 전송 (recording이 아닌 경우)"""
+        if self.serial_port and self.serial_port.is_open:
+            try:
+                encoded = command.encode('utf-8')
+                bytes_written = self.serial_port.write(encoded)
+                print(f"Sent: {command.strip()} ({bytes_written} bytes)")
+                
+                if bytes_written < len(encoded):
+                    print(f"Warning: Partial write ({bytes_written}/{len(encoded)} bytes)")
+            except serial.SerialTimeoutException:
+                print("Warning: Write timeout (buffer full)")
+            except (OSError, serial.SerialException) as e:
+                print(f"Write error: {e}")
 
 
 class App(tk.Tk):
@@ -120,10 +232,19 @@ class App(tk.Tk):
         self.title("CAN-to-USART Controller")
         self.geometry("1920x1080")
 
+        # 큐 크기 제한 제거 (무제한으로 변경)
         self.command_queue = queue.Queue()
-        self.data_queue = queue.Queue()
+        self.data_queue = queue.Queue(maxsize=0)  # maxsize=0은 무제한
         self.last_command_sent = None
         self.logger = DataLogger()
+        
+        # 통계 정보
+        self.total_received = 0
+        self.last_queue_size_report = 0
+        
+        # 상태 변수들 먼저 초기화
+        self.after_id = None
+        self.is_recording = False  # 이것을 process_serial_data() 호출 전에 초기화!
 
         # Graphing data lists
         self.timestamps = []
@@ -171,12 +292,12 @@ class App(tk.Tk):
             "Handshake": {"cmd": "D4 1 00\n"},
             "SCA Enable": {"cmd": "D4 2 2A 01\n"},
             "SCA Disable": {"cmd": "D4 2 2A 00\n"},
-            "Pos. S-curve mode": {"cmd": "D4 2 07 06\n"},
-            "Set Velocity": {"cmd": "D4 5 1F 02 88 88 88\n"},
+            "Pos. S-curve": {"cmd": "D4 2 07 06\n"},
+            "Set max Velocity": {"cmd": "D4 5 1F 03 55 55 55\n"},
             "Start Recording": {"cmd": "start_recording"},
             "Stop Recording": {"cmd": "stop_recording"},
             "Goto HIGH": {"cmd": "D4 5 0A 64 00 00 00\n"},
-            "Goto LOW": {"cmd": "D4 5 0A 00 00 00 00\n"}
+            "Goto LOW": {"cmd": "D4 5 0A 20 00 00 00\n"}
         }
         
         button_texts = list(self.button_map.keys())
@@ -200,54 +321,74 @@ class App(tk.Tk):
         self.start_serial_thread()
         self.process_serial_data()
 
-        self.after_id = None
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def initialize_button_states(self):
         """Initializes all buttons to their default states."""
         for name, button in self.buttons.items():
-            if name != "handshake":
+            if name not in ["handshake", "start_recording"]:
                 button.config(state=tk.DISABLED)
+        self.buttons["stop_recording"].config(state=tk.DISABLED)
+
 
     def process_serial_data(self):
         """Checks the data queue for new data from the serial thread and processes it."""
+        processed_count = 0
         try:
-            message_type, data = self.data_queue.get_nowait()
-            if message_type == "status":
-                print(f"Status: {data}")
-            elif message_type == "serial":
-                # Printing is now handled in handle_serial_response to show the trimmed message
-                self.handle_serial_response(data)
+            # Process multiple messages at once to avoid GUI lag
+            # 큐 처리 속도 향상: 더 많은 메시지를 한 번에 처리
+            for _ in range(1000): # 500 -> 1000으로 증가
+                message = self.data_queue.get_nowait()
+                message_type = message[0]
+                
+                if message_type == "status":
+                    print(f"Status: {message[1]}")
+                elif message_type == "serial":
+                    # message = ("serial", line, timestamp_ms)
+                    line = message[1]
+                    timestamp_ms = message[2] if len(message) > 2 else None
+                    self.handle_serial_response(line, timestamp_ms)
+                    processed_count += 1
+                    self.total_received += 1
         except queue.Empty:
             pass
         finally:
-            self.after_id = self.after(100, self.process_serial_data)
+            # 큐 크기 모니터링 (1000개마다 보고)
+            if self.is_recording and self.total_received % 1000 == 0 and self.total_received > self.last_queue_size_report:
+                queue_size = self.data_queue.qsize()
+                print(f"Total received: {self.total_received}, Queue size: {queue_size}, Processed this cycle: {processed_count}")
+                self.last_queue_size_report = self.total_received
+            
+            # 큐 처리 주기를 2ms로 단축 (5ms -> 2ms)
+            self.after_id = self.after(2, self.process_serial_data)
 
-    def handle_serial_response(self, response):
+    def handle_serial_response(self, response, timestamp_ms=None):
         """Parses serial responses and updates button states accordingly."""
         
-        # Find the start of the actual message, which should be "ID:"
         try:
-            # Make the search case-insensitive to handle "ID:" or "id:"
             start_index = response.upper().index("ID:")
-            # Slice the string to get only the relevant part
             actual_message = response[start_index:]
-            print(f"Received: {actual_message}") # Print the trimmed message
         except ValueError:
-            # "ID:" not found, this is likely an echo or debug message we can ignore
             print(f"Ignored non-standard message: {response}")
             return
 
-        # Normalize the actual message for easier comparison
-        normalized_response = ''.join(actual_message.split()).upper()
-
         # Handle ID:0x100 for logging and graphing
-        if "ID:0X100" in normalized_response:
+        if "ID:0X100" in ''.join(actual_message.split()).upper():
             parsed_data = self.parse_id_100_data(actual_message)
             if parsed_data:
-                self.logger.write_row(parsed_data)
-                self.update_graph(parsed_data)
-            return # Stop further processing for this message
+                # timestamp_ms가 없으면 현재 시간 사용 (하위 호환성)
+                if timestamp_ms is None:
+                    timestamp_ms = time.time() * 1000
+                
+                # [timestamp_ms, voltage, current, duty, pwm_pin, hyst_pin] 형태로 저장
+                log_data = [timestamp_ms] + parsed_data
+                self.logger.write_row(log_data)
+                self.append_graph_data(parsed_data) # Just append data, don't draw
+            return
+
+        # For other messages, print and process
+        print(f"Received: {actual_message}")
+        normalized_response = ''.join(actual_message.split()).upper()
 
         # Handshake: "ID: 0XD4, DLC: 2, Data: 00 01"
         if "ID:0XD4" in normalized_response and "DLC:2" in normalized_response and "DATA:0001" in normalized_response:
@@ -262,15 +403,9 @@ class App(tk.Tk):
                 self.buttons["pos._s-curve"].config(state=tk.NORMAL)
                 print("Response OK: SCA Enabled.")
             elif self.last_command_sent == "SCA Disable":
-                # Per object.md, disable action should disable almost all buttons
+                self.initialize_button_states()
+                self.buttons["handshake"].config(state=tk.NORMAL)
                 self.buttons["sca_enable"].config(state=tk.NORMAL)
-                self.buttons["sca_disable"].config(state=tk.DISABLED)
-                self.buttons["pos._s-curve"].config(state=tk.DISABLED)
-                self.buttons["set_max_velocity"].config(state=tk.DISABLED)
-                self.buttons["start_recording"].config(state=tk.DISABLED)
-                self.buttons["stop_recording"].config(state=tk.DISABLED)
-                self.buttons["goto_high"].config(state=tk.DISABLED)
-                self.buttons["goto_low"].config(state=tk.DISABLED)
                 print("Response OK: SCA Disabled.")
 
         # Pos. S-curve: "ID: 0XD4, DLC: 2, Data: 07 06" -> Actual response is 0701
@@ -288,7 +423,7 @@ class App(tk.Tk):
     def on_button_click(self, button_name):
         """Handles button click events by sending commands to the serial thread."""
         print(f"{button_name} clicked!")
-        self.last_command_sent = button_name # Store the last sent command
+        self.last_command_sent = button_name
         
         action = self.button_map.get(button_name)
         if not action:
@@ -296,18 +431,65 @@ class App(tk.Tk):
 
         command = action["cmd"]
         if command == "start_recording":
-            self.clear_graph()
+            self.is_recording = True
+            self.total_received = 0
+            self.last_queue_size_report = 0
+            
+            # 데이터 큐 클리어 (이전 측정의 잔여 데이터 제거)
+            cleared_count = 0
+            try:
+                while True:
+                    self.data_queue.get_nowait()
+                    cleared_count += 1
+            except queue.Empty:
+                pass
+            if cleared_count > 0:
+                print(f"Cleared {cleared_count} messages from data queue before starting")
+            
+            self.clear_graph_data()
+            self.clear_canvas()
             self.logger.start()
             self.command_queue.put(command)
             self.buttons["start_recording"].config(state=tk.DISABLED)
             self.buttons["stop_recording"].config(state=tk.NORMAL)
+            # 실시간 그래프 업데이트 제거 - recording 중에는 그래프 안 그림!
+            # self.periodic_graph_update() # 주석 처리
+            print("Recording started - graph will be drawn when stopped")
         elif command == "stop_recording":
-            self.logger.stop()
+            self.is_recording = False
+            
+            # 즉시 recording 중지 명령 전송
             self.command_queue.put(command)
+            
+            # 버튼 상태 즉시 업데이트
             self.buttons["start_recording"].config(state=tk.NORMAL)
             self.buttons["stop_recording"].config(state=tk.DISABLED)
+            
+            print(f"Recording stopped. Total data points: {len(self.timestamps)}")
+            print("Waiting for data queue to flush...")
+            
+            # logger는 나중에 중지 (큐에 남은 데이터가 모두 처리된 후)
+            # 500ms 후에 logger 중지 및 그래프 그리기
+            self.after(500, self._finish_recording)
         else:
             self.command_queue.put(f"send:{command}")
+    
+    def _finish_recording(self):
+        """Recording 종료 후속 처리 - 큐가 비워진 후 호출"""
+        # 큐 크기 확인
+        queue_size = self.data_queue.qsize()
+        print(f"Queue size: {queue_size}, Graph data points: {len(self.timestamps)}")
+        
+        # logger 중지
+        self.logger.stop()
+        
+        # 그래프 그리기
+        print("Drawing graph... please wait")
+        self.draw_full_graph()
+    
+    def _finish_stop_recording(self):
+        """Stop recording 후속 처리 - 더 이상 사용 안 함"""
+        pass
 
     def start_serial_thread(self):
         self.serial_thread = SerialManager(self.command_queue, self.data_queue)
@@ -319,6 +501,7 @@ class App(tk.Tk):
         print("Closing application... sending stop command to serial thread.")
         if self.after_id:
             self.after_cancel(self.after_id)
+        # graph_update_timer_id는 더 이상 사용 안 함
         self.command_queue.put("stop")
         self.serial_thread.join(timeout=2)
         print("Serial thread closed. Exiting.")
@@ -336,7 +519,14 @@ class App(tk.Tk):
                 return None
 
             voltage = int(hex_values[0] + hex_values[1], 16)
-            current = int(hex_values[2] + hex_values[3], 16)
+            
+            # Convert 16-bit unsigned current to signed integer (two's complement)
+            unsigned_current = int(hex_values[2] + hex_values[3], 16)
+            if unsigned_current > 32767:  # 2**15 - 1
+                current = unsigned_current - 65536  # 2**16
+            else:
+                current = unsigned_current
+
             duty = int(hex_values[4] + hex_values[5], 16)
             pin_states = int(hex_values[6], 16)
             
@@ -347,10 +537,9 @@ class App(tk.Tk):
         except (ValueError, IndexError):
             return None
 
-    def update_graph(self, parsed_data):
-        """Appends new data and redraws the graph."""
+    def append_graph_data(self, parsed_data):
+        """Just appends new data to the data lists."""
         voltage, current, duty, pwm_pin, hyst_pin = parsed_data
-
         self.timestamps.append(datetime.now())
         self.voltages.append(voltage)
         self.currents.append(current)
@@ -358,54 +547,94 @@ class App(tk.Tk):
         self.pwm_pins.append(pwm_pin)
         self.hyst_pins.append(hyst_pin)
 
-        # Keep the data lists from growing indefinitely
-        max_points = 100
+    def draw_full_graph(self):
+        """Redraws the graph with all the data collected during the recording session."""
+        if not self.timestamps:
+            print("No data to draw.")
+            return
+        
+        print(f"Drawing full graph with {len(self.timestamps)} data points...")
+        
+        # 데이터가 많으면 샘플링해서 그리기 (성능 향상)
+        max_points = 10000  # 5000에서 10000으로 증가
         if len(self.timestamps) > max_points:
-            self.timestamps.pop(0)
-            self.voltages.pop(0)
-            self.currents.pop(0)
-            self.duties.pop(0)
-            self.pwm_pins.pop(0)
-            self.hyst_pins.pop(0)
+            # 균등 샘플링
+            step = len(self.timestamps) // max_points
+            timestamps = self.timestamps[::step]
+            voltages = self.voltages[::step]
+            currents = self.currents[::step]
+            duties = self.duties[::step]
+            pwm_pins = self.pwm_pins[::step]
+            hyst_pins = self.hyst_pins[::step]
+            print(f"Sampled down to {len(timestamps)} points for display")
+        else:
+            timestamps = self.timestamps
+            voltages = self.voltages
+            currents = self.currents
+            duties = self.duties
+            pwm_pins = self.pwm_pins
+            hyst_pins = self.hyst_pins
+        
+        # 그래프 그리기
+        self.redraw_plots(timestamps, voltages, currents, duties, pwm_pins, hyst_pins)
+        
+        # 최종 레이아웃 조정 (한 번만)
+        self.fig.autofmt_xdate()
+        self.fig.tight_layout(pad=2.0)
+        self.canvas.draw()
+        
+        print("Graph drawing completed.")
 
-        # Redraw plots
+    def redraw_plots(self, timestamps, voltages, currents, duties, pwm_pins, hyst_pins):
+        """Helper function to perform the actual plotting."""
+        if not timestamps:
+            return
+
+        # 간단하게만 그리기 (타이틀 등은 Stop 후 draw_full_graph에서 추가)
         self.axs[0].clear()
-        self.axs[0].plot(self.timestamps, self.voltages, color='r')
-        self.axs[0].set_title("Voltage (mV)")
+        self.axs[0].plot(timestamps, voltages, color='r', linewidth=0.5)
+        self.axs[0].set_ylabel("Voltage (mV)")
+        self.axs[0].grid(True, alpha=0.3)
 
         self.axs[1].clear()
-        self.axs[1].plot(self.timestamps, self.currents, color='g')
-        self.axs[1].set_title("Current (mA)")
+        self.axs[1].plot(timestamps, currents, color='g', linewidth=0.5)
+        self.axs[1].set_ylabel("Current (mA)")
+        self.axs[1].grid(True, alpha=0.3)
 
         self.axs[2].clear()
-        self.axs[2].plot(self.timestamps, self.duties, color='b')
-        self.axs[2].set_title("PWM Duty (permille)")
+        self.axs[2].plot(timestamps, duties, color='b', linewidth=0.5)
+        self.axs[2].set_ylabel("PWM Duty (‰)")
+        self.axs[2].grid(True, alpha=0.3)
 
         self.axs[3].clear()
-        self.axs[3].step(self.timestamps, self.pwm_pins, where='post', label='PWM Pin')
-        self.axs[3].step(self.timestamps, self.hyst_pins, where='post', label='Hyst Pin')
-        self.axs[3].set_title("Pin States")
+        self.axs[3].step(timestamps, pwm_pins, where='post', label='PWM', linewidth=0.8)
+        self.axs[3].step(timestamps, hyst_pins, where='post', label='Hyst', linewidth=0.8)
+        self.axs[3].set_ylabel("Pin States")
         self.axs[3].set_yticks([0, 1])
         self.axs[3].set_yticklabels(['LOW', 'HIGH'])
-        self.axs[3].legend()
+        self.axs[3].legend(loc='upper right', fontsize=8)
+        self.axs[3].grid(True, alpha=0.3)
 
-        self.fig.autofmt_xdate()
-        self.fig.tight_layout(pad=3.0)
-        self.canvas.draw()
-
-    def clear_graph(self):
-        """Clears all data from the graph while preserving titles."""
+    def clear_graph_data(self):
+        """Clears all data lists."""
         self.timestamps.clear()
         self.voltages.clear()
         self.currents.clear()
         self.duties.clear()
         self.pwm_pins.clear()
         self.hyst_pins.clear()
+
+    def clear_canvas(self):
+        """Clears the graph canvas."""
         for ax in self.axs:
-            # ax.clear() removes everything, including title and labels.
-            # Instead, we remove only the lines (the plotted data).
-            for line in ax.lines:
-                line.remove()
+            ax.clear() # Clear everything
+            # Restore titles and labels
+        self.axs[0].set_title("Voltage (mV)")
+        self.axs[1].set_title("Current (mA)")
+        self.axs[2].set_title("PWM Duty (permille)")
+        self.axs[3].set_title("Pin States")
+        self.axs[3].set_yticks([0, 1])
+        self.axs[3].set_yticklabels(['LOW', 'HIGH'])
         self.canvas.draw()
 
 
