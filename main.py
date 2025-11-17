@@ -293,11 +293,11 @@ class App(tk.Tk):
             "SCA Enable": {"cmd": "D4 2 2A 01\n"},
             "SCA Disable": {"cmd": "D4 2 2A 00\n"},
             "Pos. S-curve": {"cmd": "D4 2 07 06\n"},
-            "Set max Velocity": {"cmd": "D4 5 1F 03 55 55 55\n"},
+            "Set max Velocity": {"cmd": "D4 5 1F 02 88 88 88\n"},
             "Start Recording": {"cmd": "start_recording"},
             "Stop Recording": {"cmd": "stop_recording"},
             "Goto HIGH": {"cmd": "D4 5 0A 64 00 00 00\n"},
-            "Goto LOW": {"cmd": "D4 5 0A 20 00 00 00\n"}
+            "Goto LOW": {"cmd": "D4 5 0A 00 00 00 00\n"}
         }
         
         button_texts = list(self.button_map.keys())
@@ -335,9 +335,8 @@ class App(tk.Tk):
         """Checks the data queue for new data from the serial thread and processes it."""
         processed_count = 0
         try:
-            # Process multiple messages at once to avoid GUI lag
-            # 큐 처리 속도 향상: 더 많은 메시지를 한 번에 처리
-            for _ in range(1000): # 500 -> 1000으로 증가
+            # 큐에 있는 모든 데이터를 한 번에 처리 (무제한)
+            while True:
                 message = self.data_queue.get_nowait()
                 message_type = message[0]
                 
