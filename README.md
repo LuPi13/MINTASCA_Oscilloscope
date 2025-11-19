@@ -25,7 +25,7 @@ COM 포트, 통신 속도(Baud rate) 등 시리얼 설정을 변경하려면 `Se
 
 ```python
 # main.py -> class SerialManager -> run() 메서드 내부
-self.serial_port = serial.Serial('COM5', 921600, timeout=1)
+self.serial_port = serial.Serial('COM5', 1500000, timeout=1)
 ```
 
 ### 2. 버튼 이름 및 전송 명령어 변경

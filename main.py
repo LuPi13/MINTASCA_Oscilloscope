@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import threading
 import queue
@@ -55,7 +56,7 @@ class SerialManager(threading.Thread):
         self.stop_event = threading.Event()
         self.recording = False
         self.last_sent_time = 0
-        self.recording_interval = 0.001 # 1ms
+        self.recording_interval = 0.002 # 2ms
         self.send_count = 0  # 전송 카운터
         self.buffer_warning_count = 0  # 버퍼 경고 카운터
 
@@ -608,6 +609,10 @@ class App(tk.Tk):
         
         # 그래프 그리기
         self.redraw_plots(timestamps, voltages, currents, gpio_pins)
+        
+        # 시간축 포맷 설정: HH:MM:SS 형식 (소숫점 제거)
+        date_formatter = mdates.DateFormatter('%H:%M:%S')
+        self.axs[2].xaxis.set_major_formatter(date_formatter)
         
         # 최종 레이아웃 조정 (한 번만)
         self.fig.autofmt_xdate()
