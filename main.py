@@ -28,12 +28,12 @@ class DataLogger:
         self.file = open(filepath, 'w', newline='', buffering=1)  # Line buffering
         self.writer = csv.writer(self.file)
         # Write header
-        self.writer.writerow(["timestamp_ms", "voltage_mV", "current_mA", "pwm_duty_permille", "pwm_pin_state", "hyst_pin_state"])
+        self.writer.writerow(["timestamp_ms", "voltage_mV", "current_mA", "gpio_pin_state"])
         self.is_logging = True
         print(f"Logging started to {filepath}")
 
     def write_row(self, data_row):
-        """data_row는 이제 [timestamp_ms, voltage, current, duty, pwm_pin, hyst_pin] 형태로 받음"""
+        """data_row는 [timestamp_ms, voltage, current, gpio_pin] 형태로 받음"""
         if self.writer and self.is_logging:
             self.writer.writerow(data_row)
 
@@ -65,7 +65,7 @@ class SerialManager(threading.Thread):
             # rtscts와 xonxoff를 명시적으로 비활성화
             self.serial_port = serial.Serial(
                 port='COM5',
-                baudrate=921600,
+                baudrate=1500000,
                 timeout=0,  # Non-blocking read
                 write_timeout=0,  # Non-blocking write
                 rtscts=False,  # 하드웨어 플로우 컨트롤 비활성화
@@ -250,9 +250,7 @@ class App(tk.Tk):
         self.timestamps = []
         self.voltages = []
         self.currents = []
-        self.duties = []
-        self.pwm_pins = []
-        self.hyst_pins = []
+        self.gpio_pins = []
 
         # Main frame
         main_frame = ttk.Frame(self, padding="10")
@@ -271,17 +269,18 @@ class App(tk.Tk):
         scope_frame = ttk.LabelFrame(main_frame, text="Oscilloscope", padding="10")
         scope_frame.grid(row=0, column=1, sticky="nsew")
 
-        # Matplotlib Figure
-        self.fig, self.axs = plt.subplots(4, 1, sharex=True, figsize=(8, 6))
+        # Matplotlib Figure - 3개 서브플롯 (전압, 전류, GPIO 핀)
+        # height_ratios: 전압과 전류는 크게(3), GPIO 핀은 작게(1)
+        self.fig, self.axs = plt.subplots(3, 1, sharex=True, figsize=(8, 6), 
+                                          gridspec_kw={'height_ratios': [3, 3, 1]})
         self.fig.tight_layout(pad=3.0)
 
         self.axs[0].set_title("Voltage (mV)")
         self.axs[1].set_title("Current (mA)")
-        self.axs[2].set_title("PWM Duty (permille)")
-        self.axs[3].set_title("Pin States")
+        self.axs[2].set_title("GPIO Pin State")
         
-        self.axs[3].set_yticks([0, 1])
-        self.axs[3].set_yticklabels(['LOW', 'HIGH'])
+        self.axs[2].set_yticks([0, 1])
+        self.axs[2].set_yticklabels(['LOW', 'HIGH'])
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=scope_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -316,6 +315,25 @@ class App(tk.Tk):
             button = ttk.Button(controls_frame, text=text, command=lambda t=text: self.on_button_click(t))
             button.grid(row=i, column=0, sticky="nsew", pady=5)
             self.buttons[btn_name] = button
+
+        # 입력창과 Send 버튼 추가
+        # 버튼 개수만큼 행이 사용되었으므로, 그 다음 행부터 시작
+        next_row = len(button_texts)
+        
+        # 입력창 레이블
+        input_label = ttk.Label(controls_frame, text="Custom Command:", font=('Helvetica', 12))
+        input_label.grid(row=next_row, column=0, sticky="w", padx=10, pady=(20, 5))
+        
+        # 입력창 (Entry)
+        self.custom_input = ttk.Entry(controls_frame, font=('Helvetica', 14))
+        self.custom_input.grid(row=next_row+1, column=0, sticky="ew", padx=10, pady=5)
+        
+        # Send 버튼
+        send_button = ttk.Button(controls_frame, text="Send", command=self.on_send_custom_command)
+        send_button.grid(row=next_row+2, column=0, sticky="ew", padx=10, pady=5)
+        
+        # Enter 키로도 전송 가능하도록
+        self.custom_input.bind('<Return>', lambda event: self.on_send_custom_command())
 
         self.initialize_button_states()
         self.start_serial_thread()
@@ -379,7 +397,7 @@ class App(tk.Tk):
                 if timestamp_ms is None:
                     timestamp_ms = time.time() * 1000
                 
-                # [timestamp_ms, voltage, current, duty, pwm_pin, hyst_pin] 형태로 저장
+                # [timestamp_ms, voltage, current, gpio_pin] 형태로 저장
                 log_data = [timestamp_ms] + parsed_data
                 self.logger.write_row(log_data)
                 self.append_graph_data(parsed_data) # Just append data, don't draw
@@ -421,7 +439,7 @@ class App(tk.Tk):
 
     def on_button_click(self, button_name):
         """Handles button click events by sending commands to the serial thread."""
-        print(f"{button_name} clicked!")
+        # print(f"{button_name} clicked!")
         self.last_command_sent = button_name
         
         action = self.button_map.get(button_name)
@@ -473,6 +491,23 @@ class App(tk.Tk):
         else:
             self.command_queue.put(f"send:{command}")
     
+    def on_send_custom_command(self):
+        """입력창의 문자열을 읽어서 UART로 전송"""
+        command_text = self.custom_input.get().strip()
+        
+        if not command_text:
+            print("No command entered")
+            return
+        
+        # '\n'을 붙여서 전송
+        command_with_newline = command_text + '\n'
+        
+        print(f"Sending custom command: {command_text}")
+        self.command_queue.put(f"send:{command_with_newline}")
+        
+        # 입력창 비우기 (선택사항)
+        # self.custom_input.delete(0, tk.END)
+    
     def _finish_recording(self):
         """Recording 종료 후속 처리 - 큐가 비워진 후 호출"""
         # 큐 크기 확인
@@ -507,44 +542,45 @@ class App(tk.Tk):
         self.destroy()
 
     def parse_id_100_data(self, message):
-        """Parses the data string for ID 0x100."""
+        """Parses the data string for ID 0x100.
+        New format: DLC: 5, Data: [0-1](V_mV) [2-3](I_mA) [4](pin state: 0 or 1)
+        """
         try:
             parts = message.split('Data:')
             if len(parts) < 2:
                 return None
             
             hex_values = parts[1].strip().split()
-            if len(hex_values) < 8:
+            if len(hex_values) < 5:
                 return None
 
+            # [0-1]: Voltage in mV (16-bit unsigned)
             voltage = int(hex_values[0] + hex_values[1], 16)
             
-            # Convert 16-bit unsigned current to signed integer (two's complement)
+            # [2-3]: Current in mA (16-bit signed, two's complement)
             unsigned_current = int(hex_values[2] + hex_values[3], 16)
             if unsigned_current > 32767:  # 2**15 - 1
                 current = unsigned_current - 65536  # 2**16
             else:
                 current = unsigned_current
 
-            duty = int(hex_values[4] + hex_values[5], 16)
-            pin_states = int(hex_values[6], 16)
+            # [4]: GPIO pin state (0 or 1)
+            gpio_pin = int(hex_values[4], 16)
             
-            pwm_pin = (pin_states >> 1) & 1
-            hyst_pin = pin_states & 1
-            
-            return [voltage, current, duty, pwm_pin, hyst_pin]
+            # Return: [voltage, current, gpio_pin]
+            return [voltage, current, gpio_pin]
         except (ValueError, IndexError):
             return None
 
     def append_graph_data(self, parsed_data):
-        """Just appends new data to the data lists."""
-        voltage, current, duty, pwm_pin, hyst_pin = parsed_data
+        """Just appends new data to the data lists.
+        parsed_data: [voltage, current, gpio_pin]
+        """
+        voltage, current, gpio_pin = parsed_data
         self.timestamps.append(datetime.now())
         self.voltages.append(voltage)
         self.currents.append(current)
-        self.duties.append(duty)
-        self.pwm_pins.append(pwm_pin)
-        self.hyst_pins.append(hyst_pin)
+        self.gpio_pins.append(gpio_pin)
 
     def draw_full_graph(self):
         """Redraws the graph with all the data collected during the recording session."""
@@ -562,20 +598,16 @@ class App(tk.Tk):
             timestamps = self.timestamps[::step]
             voltages = self.voltages[::step]
             currents = self.currents[::step]
-            duties = self.duties[::step]
-            pwm_pins = self.pwm_pins[::step]
-            hyst_pins = self.hyst_pins[::step]
+            gpio_pins = self.gpio_pins[::step]
             print(f"Sampled down to {len(timestamps)} points for display")
         else:
             timestamps = self.timestamps
             voltages = self.voltages
             currents = self.currents
-            duties = self.duties
-            pwm_pins = self.pwm_pins
-            hyst_pins = self.hyst_pins
+            gpio_pins = self.gpio_pins
         
         # 그래프 그리기
-        self.redraw_plots(timestamps, voltages, currents, duties, pwm_pins, hyst_pins)
+        self.redraw_plots(timestamps, voltages, currents, gpio_pins)
         
         # 최종 레이아웃 조정 (한 번만)
         self.fig.autofmt_xdate()
@@ -584,44 +616,37 @@ class App(tk.Tk):
         
         print("Graph drawing completed.")
 
-    def redraw_plots(self, timestamps, voltages, currents, duties, pwm_pins, hyst_pins):
+    def redraw_plots(self, timestamps, voltages, currents, gpio_pins):
         """Helper function to perform the actual plotting."""
         if not timestamps:
             return
 
-        # 간단하게만 그리기 (타이틀 등은 Stop 후 draw_full_graph에서 추가)
+        # 전압 그래프 (크게)
         self.axs[0].clear()
         self.axs[0].plot(timestamps, voltages, color='r', linewidth=0.5)
         self.axs[0].set_ylabel("Voltage (mV)")
         self.axs[0].grid(True, alpha=0.3)
 
+        # 전류 그래프 (크게)
         self.axs[1].clear()
         self.axs[1].plot(timestamps, currents, color='g', linewidth=0.5)
         self.axs[1].set_ylabel("Current (mA)")
         self.axs[1].grid(True, alpha=0.3)
 
+        # GPIO 핀 상태 그래프 (작게)
         self.axs[2].clear()
-        self.axs[2].plot(timestamps, duties, color='b', linewidth=0.5)
-        self.axs[2].set_ylabel("PWM Duty (‰)")
+        self.axs[2].step(timestamps, gpio_pins, where='post', color='b', linewidth=0.8)
+        self.axs[2].set_ylabel("GPIO Pin")
+        self.axs[2].set_yticks([0, 1])
+        self.axs[2].set_yticklabels(['LOW', 'HIGH'])
         self.axs[2].grid(True, alpha=0.3)
-
-        self.axs[3].clear()
-        self.axs[3].step(timestamps, pwm_pins, where='post', label='PWM', linewidth=0.8)
-        self.axs[3].step(timestamps, hyst_pins, where='post', label='Hyst', linewidth=0.8)
-        self.axs[3].set_ylabel("Pin States")
-        self.axs[3].set_yticks([0, 1])
-        self.axs[3].set_yticklabels(['LOW', 'HIGH'])
-        self.axs[3].legend(loc='upper right', fontsize=8)
-        self.axs[3].grid(True, alpha=0.3)
 
     def clear_graph_data(self):
         """Clears all data lists."""
         self.timestamps.clear()
         self.voltages.clear()
         self.currents.clear()
-        self.duties.clear()
-        self.pwm_pins.clear()
-        self.hyst_pins.clear()
+        self.gpio_pins.clear()
 
     def clear_canvas(self):
         """Clears the graph canvas."""
@@ -630,10 +655,9 @@ class App(tk.Tk):
             # Restore titles and labels
         self.axs[0].set_title("Voltage (mV)")
         self.axs[1].set_title("Current (mA)")
-        self.axs[2].set_title("PWM Duty (permille)")
-        self.axs[3].set_title("Pin States")
-        self.axs[3].set_yticks([0, 1])
-        self.axs[3].set_yticklabels(['LOW', 'HIGH'])
+        self.axs[2].set_title("GPIO Pin State")
+        self.axs[2].set_yticks([0, 1])
+        self.axs[2].set_yticklabels(['LOW', 'HIGH'])
         self.canvas.draw()
 
 
